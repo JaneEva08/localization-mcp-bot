@@ -1,6 +1,12 @@
 .env
-venv/
 .venv/
 __pycache__/
 *.pyc
+data/
 *.db
+*.db-*
+*.sqlite*
+*.xlsx
+*.txt
+!requirements.txt
+!requirements-lock.txt

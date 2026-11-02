@@ -1,133 +1,113 @@
-"""SQLite-слой книжного магазина: подключение, инициализация, тестовые данные и запросы."""
-import os
-import random
+"""Поиск только для чтения. Значения локализации не изменяются."""
+import json
 import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "books.db")
+from settings import DB_PATH
 
-GENRES = {
-    "Фантастика": ["Звёздный дрейф", "Последний рейс", "Город на орбите", "Эхо галактики", "Кибер-сад"],
-    "Детектив": ["Тёмная аллея", "Дело о хрустальной вазе", "Ночной свидетель", "Тихий омут", "Улика"],
-    "Роман": ["Осенний вальс", "Письма из Венеции", "Дом у реки", "Время сирени", "Зимняя соната"],
-    "Научпоп": ["Как устроен мозг", "Квантовый мир", "История вещей", "Математика вокруг", "Биология жизни"],
-    "Программирование": ["Python с нуля", "Чистая архитектура API", "Алгоритмы простыми словами", "SQL на практике", "Основы MCP"],
-    "Детям": ["Приключения ежа", "Сказки про луну", "Весёлая азбука", "Тайна старого сада", "Лесные друзья"],
-}
-AUTHORS = [
-    "А. Волков", "М. Орлова", "И. Седов", "Е. Громова", "Д. Ларин",
-    "О. Киселёва", "П. Румянцев", "Н. Белова", "С. Фролов", "Т. Миронова",
-]
+SCHEMA = """
+CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE records (
+ excel_row INTEGER PRIMARY KEY, source_table TEXT NOT NULL, is_client TEXT NOT NULL,
+ record_name TEXT NOT NULL, attribute TEXT NOT NULL, source_jd TEXT NOT NULL,
+ russian TEXT NOT NULL, chinese TEXT NOT NULL, ru_fold TEXT NOT NULL, zh_fold TEXT NOT NULL
+);
+"""
+INDEXES = """
+CREATE INDEX by_record ON records(source_table, record_name, attribute);
+CREATE INDEX by_ru ON records(ru_fold);
+CREATE INDEX by_zh ON records(zh_fold);
+"""
 
 
-def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+@contextmanager
+def connect(path: Path = DB_PATH):
+    if not path.is_file():
+        raise ValueError("База не найдена. Сначала выполните импорт Excel.")
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-    # SQLite сравнивает регистр только для ASCII, поэтому для кириллицы своя lower()
-    conn.create_function("py_lower", 1, lambda s: s.lower() if isinstance(s, str) else s)
-    return conn
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
-def init_db() -> None:
-    with get_connection() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS books (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                author TEXT NOT NULL,
-                genre TEXT NOT NULL,
-                price REAL NOT NULL
-            )
-            """
-        )
+def metadata(conn):
+    return {r["key"]: json.loads(r["value"]) for r in conn.execute("SELECT * FROM metadata")}
 
 
-def populate_test_data(count: int = 100) -> bool:
-    """Заполняет пустую таблицу тестовыми книгами. Возвращает True, если данные добавлены."""
-    with get_connection() as conn:
-        if conn.execute("SELECT COUNT(*) FROM books").fetchone()[0] > 0:
-            return False
-        rng = random.Random(42)  # детерминированно: одинаковые данные при каждой инициализации
-        rows = []
-        for i in range(1, count + 1):
-            genre = rng.choice(list(GENRES))
-            title = f"{rng.choice(GENRES[genre])} {i}"
-            rows.append((title, rng.choice(AUTHORS), genre, round(rng.uniform(150, 1500), 2)))
-        conn.executemany("INSERT INTO books (title, author, genre, price) VALUES (?, ?, ?, ?)", rows)
-        return True
+def code_from_name(value: str):
+    if value.isascii() and value.isdigit():
+        number = int(value)
+        if number % 1000 == 0:
+            return str(number // 1000)
+    return None
 
 
-def _rows(cursor: sqlite3.Cursor) -> list[dict]:
-    return [dict(r) for r in cursor.fetchall()]
+def record(row):
+    result = {k: row[k] for k in (
+        "excel_row", "source_table", "is_client", "record_name", "attribute", "russian", "chinese"
+    )}
+    if row["source_table"] in ("CommonItem.txt", "CommonItemTips.txt"):
+        result["item_code"] = code_from_name(row["record_name"])
+    return result
 
 
-def list_books(limit: int = 20, offset: int = 0) -> dict:
-    with get_connection() as conn:
-        total = conn.execute("SELECT COUNT(*) FROM books").fetchone()[0]
-        books = _rows(conn.execute("SELECT * FROM books ORDER BY id LIMIT ? OFFSET ?", (limit, offset)))
-    return {"total": total, "offset": offset, "books": books}
+def check_page(offset, limit):
+    if type(offset) is not int or offset < 0 or offset > 1_000_000:
+        raise ValueError("Смещение должно быть целым числом от 0 до 1000000.")
+    if type(limit) is not int or not 1 <= limit <= 5:
+        raise ValueError("Размер страницы должен быть от 1 до 5.")
 
 
-def find_by_title(title: str) -> list[dict]:
-    with get_connection() as conn:
-        return _rows(conn.execute(
-            "SELECT * FROM books WHERE py_lower(title) LIKE ? ORDER BY id", (f"%{title.lower()}%",)))
+def search(query: str, language: str, offset=0, limit=5, item_mode=None, path=DB_PATH):
+    check_page(offset, limit)
+    if not isinstance(query, str) or not query.strip() or len(query) > 500:
+        raise ValueError("Укажите текст длиной от 1 до 500 символов.")
+    if language not in ("russian", "chinese", "both"):
+        raise ValueError("Неизвестный язык поиска.")
+    columns = {"russian": ["ru_fold"], "chinese": ["zh_fold"], "both": ["ru_fold", "zh_fold"]}[language]
+    filters, base_args = [], []
+    if item_mode is not None:
+        table, attribute = {"name": ("CommonItem.txt", "Name"), "description": ("CommonItemTips.txt", "Tips")}[item_mode]
+        filters.append("source_table = ? AND attribute = ?")
+        base_args.extend([table, attribute])
+    folded = query.strip().casefold()
+    with connect(path) as conn:
+        exact = "(" + " OR ".join(f"{c} = ?" for c in columns) + ")"
+        where = " AND ".join([*filters, exact])
+        exact_args = [*base_args, *([folded] * len(columns))]
+        has_exact = conn.execute(f"SELECT 1 FROM records WHERE {where} LIMIT 1", exact_args).fetchone()
+        match_mode = "exact" if has_exact else "contains"
+        if not has_exact:
+            contains = "(" + " OR ".join(f"instr({c}, ?) > 0" for c in columns) + ")"
+            where = " AND ".join([*filters, contains])
+        rows = conn.execute(
+            f"SELECT * FROM records WHERE {where} ORDER BY excel_row LIMIT ? OFFSET ?",
+            [*exact_args, limit + 1, offset],
+        ).fetchall()
+        result = {"source": metadata(conn), "match_mode": match_mode, "offset": offset,
+                  "has_more": len(rows) > limit, "records": [record(r) for r in rows[:limit]]}
+        if item_mode:
+            for entry in result["records"]:
+                entry["related"] = item_rows(conn, entry["record_name"])
+        return result
 
 
-def find_by_id(book_id: int) -> dict | None:
-    with get_connection() as conn:
-        row = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
-        return dict(row) if row else None
+def item_rows(conn, name):
+    rows = conn.execute(
+        "SELECT * FROM records WHERE record_name = ? AND "
+        "((source_table = 'CommonItem.txt' AND attribute = 'Name') OR "
+        "(source_table = 'CommonItemTips.txt' AND attribute = 'Tips')) ORDER BY excel_row", (name,)
+    ).fetchall()
+    return [record(r) for r in rows]
 
 
-def find_by_genre(genre: str) -> list[dict]:
-    with get_connection() as conn:
-        return _rows(conn.execute(
-            "SELECT * FROM books WHERE py_lower(genre) LIKE ? ORDER BY id", (f"%{genre.lower()}%",)))
-
-
-def find_by_author(author: str) -> list[dict]:
-    with get_connection() as conn:
-        return _rows(conn.execute(
-            "SELECT * FROM books WHERE py_lower(author) LIKE ? ORDER BY id", (f"%{author.lower()}%",)))
-
-
-def add_book(title: str, author: str, genre: str, price: float) -> dict:
-    with get_connection() as conn:
-        cur = conn.execute(
-            "INSERT INTO books (title, author, genre, price) VALUES (?, ?, ?, ?)",
-            (title, author, genre, price))
-        return {"id": cur.lastrowid, "title": title, "author": author, "genre": genre, "price": price}
-
-
-def update_price(book_id: int, price: float) -> dict | None:
-    with get_connection() as conn:
-        cur = conn.execute("UPDATE books SET price = ? WHERE id = ?", (price, book_id))
-        if cur.rowcount == 0:
-            return None
-    return find_by_id(book_id)
-
-
-def delete_book(book_id: int) -> dict | None:
-    book = find_by_id(book_id)
-    if book is None:
-        return None
-    with get_connection() as conn:
-        conn.execute("DELETE FROM books WHERE id = ?", (book_id,))
-    return book
-
-
-def get_stats() -> dict:
-    with get_connection() as conn:
-        total, avg_price, min_price, max_price = conn.execute(
-            "SELECT COUNT(*), AVG(price), MIN(price), MAX(price) FROM books").fetchone()
-        genres = _rows(conn.execute(
-            "SELECT genre, COUNT(*) AS count, ROUND(AVG(price), 2) AS avg_price "
-            "FROM books GROUP BY genre ORDER BY count DESC"))
-    return {
-        "total_books": total,
-        "avg_price": round(avg_price, 2) if avg_price is not None else None,
-        "min_price": min_price,
-        "max_price": max_price,
-        "genres": genres,
-    }
+def item_by_code(item_id: str, path=DB_PATH):
+    if not isinstance(item_id, str) or not item_id.isascii() or not item_id.isdigit() or len(item_id) > 15:
+        raise ValueError("Код предмета должен содержать от 1 до 15 цифр, без дробной части.")
+    name = str(int(item_id) * 1000)
+    with connect(path) as conn:
+        return {"source": metadata(conn), "item_code": str(int(item_id)), "record_name": name,
+                "records": item_rows(conn, name), "has_more": False}

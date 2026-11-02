@@ -1,89 +1,39 @@
-"""MCP-сервер книжного магазина (product-mcp): FastAPI + SQLite.
+"""Настоящий MCP Streamable HTTP на loopback, четыре инструмента чтения."""
+import os
+from typing import Literal
 
-Эндпоинты:
-  GET  /health  - проверка работоспособности
-  GET  /tools   - список инструментов в формате MCP JSON Schema
-  POST /call    - вызов инструмента: {"name": "...", "arguments": {...}}
-  POST /mcp     - JSON-RPC 2.0 (initialize, tools/list, tools/call)
-"""
-import json
-import logging
-from contextlib import asynccontextmanager
+from mcp.server.fastmcp import FastMCP
 
-import uvicorn
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from mcp_server import db
 
-import db
-from tools import MCP_TOOLS, ToolError, call_tool
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("product-mcp")
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    db.init_db()
-    if db.populate_test_data():
-        log.info("База пуста: добавлено 100 тестовых книг")
-    else:
-        log.info("В базе уже есть данные, заполнение пропущено")
-    yield
+mcp = FastMCP("localization-search", host="127.0.0.1", port=int(os.getenv("MCP_PORT", "8000")), json_response=True, stateless_http=True)
 
 
-app = FastAPI(title="product-mcp", version="1.0.0", lifespan=lifespan)
+@mcp.tool()
+def search_russian(query: str, offset: int = 0, limit: int = 5) -> dict:
+    """Поиск игрового русского перевода TranslateTextJD; вернуть китайский оригинал и атрибуты. Сначала точное совпадение, иначе подстрока."""
+    return db.search(query, "russian", offset, limit)
 
 
-class CallRequest(BaseModel):
-    name: str
-    arguments: dict = Field(default_factory=dict)
+@mcp.tool()
+def search_chinese(query: str, offset: int = 0, limit: int = 5) -> dict:
+    """Поиск китайского оригинала NeedTranslateTextJD_CHN; вернуть игровой русский перевод и атрибуты."""
+    return db.search(query, "chinese", offset, limit)
 
 
-@app.get("/health")
-def health() -> dict:
-    return {"status": "ok"}
+@mcp.tool()
+def find_item(query: str, mode: Literal["name", "description", ""] = "", offset: int = 0, limit: int = 5) -> dict:
+    """Код предмета по тексту. name: только CommonItem.txt/ColName=Name; description: только CommonItemTips.txt/ColName=Tips. Если пользователь не уточнил название или описание, оставь mode пустым. Код = столбец Name / 1000. Ищет русский и китайский текст."""
+    if not mode:
+        return {"clarification": "Искать код предмета по названию или по описанию?", "query": query}
+    return db.search(query, "both", offset, limit, item_mode=mode)
 
 
-@app.get("/tools")
-def list_tools() -> dict:
-    return {"tools": MCP_TOOLS}
-
-
-@app.post("/call")
-def call(request: CallRequest) -> dict:
-    log.info("call %s %s", request.name, request.arguments)
-    try:
-        return {"result": call_tool(request.name, request.arguments)}
-    except ToolError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.post("/mcp")
-def mcp_rpc(request: dict) -> dict:
-    """Минимальная реализация MCP поверх JSON-RPC 2.0."""
-    req_id, method, params = request.get("id"), request.get("method"), request.get("params") or {}
-    try:
-        if method == "initialize":
-            result = {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "product-mcp", "version": "1.0.0"},
-            }
-        elif method == "tools/list":
-            result = {"tools": MCP_TOOLS}
-        elif method == "tools/call":
-            try:
-                data = call_tool(params.get("name", ""), params.get("arguments"))
-                result = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]}
-            except ToolError as exc:
-                result = {"content": [{"type": "text", "text": str(exc)}], "isError": True}
-        else:
-            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown method: {method}"}}
-    except Exception as exc:  # noqa: BLE001 - JSON-RPC должен всегда вернуть ответ
-        log.exception("Ошибка обработки %s", method)
-        return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32603, "message": str(exc)}}
-    return {"jsonrpc": "2.0", "id": req_id, "result": result}
+@mcp.tool()
+def get_item(item_id: str) -> dict:
+    """Найти название и описание предмета по коду для выдачи. Например, код 12 соответствует столбцу Name=12000. Не передавай сюда уже умноженное значение Name."""
+    return db.item_by_code(item_id)
 
 
 if __name__ == "__main__":
-    print("MCP Server запущен на http://localhost:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    mcp.run(transport="streamable-http")

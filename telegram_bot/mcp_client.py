@@ -1,40 +1,41 @@
-"""HTTP-клиент для MCP-сервера: получение списка инструментов и их вызов."""
+"""MCP SDK выполняет initialize, tools/list и tools/call по HTTP."""
 import json
+from contextlib import asynccontextmanager
 
 import httpx
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
 
-from config import MCP_SERVER_URL
-
-_TIMEOUT = 15.0
-
-
-async def list_tools() -> list[dict]:
-    """Запрашивает у сервера актуальный список инструментов (MCP JSON Schema)."""
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        response = await client.get(f"{MCP_SERVER_URL}/tools")
-        response.raise_for_status()
-        return response.json()["tools"]
+from settings import MCP_URL
 
 
-async def call_tool(name: str, arguments: dict) -> str:
-    """Вызывает инструмент и возвращает ответ строкой JSON (ошибки тоже строкой, чтобы их увидела LLM)."""
-    try:
-        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            response = await client.post(f"{MCP_SERVER_URL}/call", json={"name": name, "arguments": arguments})
-    except httpx.HTTPError as exc:
-        return json.dumps({"error": f"MCP-сервер недоступен: {exc}"}, ensure_ascii=False)
-    if response.status_code != 200:
-        detail = response.json().get("detail", response.text) if response.content else response.text
-        return json.dumps({"error": detail}, ensure_ascii=False)
-    return json.dumps(response.json()["result"], ensure_ascii=False)
+@asynccontextmanager
+async def session(url=MCP_URL):
+    async with httpx.AsyncClient(timeout=60, trust_env=False) as http:
+        async with streamable_http_client(url, http_client=http) as (read, write, _):
+            async with ClientSession(read, write) as client:
+                await client.initialize()
+                yield client
 
 
-def to_openai_tools(mcp_tools: list[dict]) -> list[dict]:
-    """Преобразует MCP-описание инструментов в формат function calling OpenAI."""
-    return [
-        {
-            "type": "function",
-            "function": {"name": t["name"], "description": t["description"], "parameters": t["inputSchema"]},
-        }
-        for t in mcp_tools
-    ]
+async def list_tools():
+    async with session() as client:
+        tools = (await client.list_tools()).tools
+        return [{"type": "function", "function": {
+            "name": t.name, "description": t.description, "parameters": t.inputSchema
+        }} for t in tools]
+
+
+async def call_tool(name, arguments):
+    async with session() as client:
+        response = await client.call_tool(name, arguments)
+    return decode(response)
+
+
+def decode(response):
+    content = "\n".join(c.text for c in response.content if c.type == "text")
+    if response.isError:
+        raise ValueError(content)
+    if response.structuredContent is not None:
+        return response.structuredContent
+    return json.loads(content)
